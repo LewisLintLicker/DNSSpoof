@@ -1,0 +1,2 @@
+# Slow it down significantly (e.g., 50 packets per second total) to not be malicious
+sudo mdk4 wlan b -f ssids.txt -s 50
